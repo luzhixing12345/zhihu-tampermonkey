@@ -2,7 +2,7 @@
 // @name         知乎收藏夹搜索
 // @name:en      Zhihu Collection Search
 // @namespace    https://github.com/RustyPiano/zhihu-to-markdown
-// @version      1.0.0
+// @version      1.0.1
 // @description  为知乎收藏夹添加本地搜索、查询和跳转功能
 // @description:en  Add local search, indexing, and jump features to Zhihu collections
 // @author       RustyPiano
@@ -120,7 +120,7 @@
             <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #e4e4e7;">
                 <div style="display:flex;align-items:center;gap:8px;min-width:0;">
                     <div style="font-size:15px;font-weight:600;white-space:nowrap;">收藏夹搜索</div>
-                    <button type="button" data-role="load" style="${buttonStyle(true)}">重新构建收藏夹索引</button>
+                    <button type="button" data-role="load" title="点击增量更新；按住 Shift 点击全量重建" style="${buttonStyle(true)}">更新收藏夹索引</button>
                 </div>
                 <button type="button" data-role="close" style="border:none;background:transparent;color:#71717a;cursor:pointer;font-size:18px;line-height:1;padding:2px 4px;">&times;</button>
             </div>
@@ -146,7 +146,7 @@
         panel.querySelector('[data-role="close"]').addEventListener('click', () => {
             panel.style.display = 'none';
         });
-        state.ui.loadButton.addEventListener('click', () => loadCollection(true));
+        state.ui.loadButton.addEventListener('click', (event) => loadCollection(event.shiftKey));
         state.ui.searchButton.addEventListener('click', handleSearch);
         state.ui.input.addEventListener('keydown', (event) => {
             if (event.key === 'Enter') {
@@ -174,19 +174,23 @@
 
     async function loadCollection(forceRefresh) {
         if (state.loading) return;
-        if (state.loaded && !forceRefresh) return;
 
         state.loading = true;
         setLoading(true);
-        setStatus('正在查询收藏夹...');
+        const incremental = !forceRefresh && state.items.length > 0;
+        setStatus(incremental ? '正在增量更新收藏夹索引...' : '正在查询收藏夹...');
         showIndexingMessage();
 
         try {
-            const allItems = [];
+            const fetchedItems = [];
+            const cachedItems = forceRefresh ? [] : state.items.slice();
+            const cachedKeys = new Set(cachedItems.map(getItemKey));
+            const cachedIndexByKey = new Map(cachedItems.map((item, index) => [getItemKey(item), index]));
             const seen = new Set();
             let offset = 0;
             let total = 0;
             let isEnd = false;
+            let reachedCachedItem = false;
 
             while (!isEnd) {
                 const url = `/api/v4/collections/${state.collectionId}/items?offset=${offset}&limit=${CONFIG.pageSize}`;
@@ -206,23 +210,44 @@
                 total = data.paging?.totals || total || pageItems.length;
 
                 for (const item of pageItems) {
-                    const key = item.id || item.url || item.title;
-                    if (!seen.has(key)) {
-                        seen.add(key);
-                        allItems.push(item);
+                    const key = getItemKey(item);
+                    if (!key || seen.has(key)) {
+                        continue;
                     }
+
+                    seen.add(key);
+                    if (incremental && cachedKeys.has(key)) {
+                        const cachedIndex = cachedIndexByKey.get(key);
+                        if (typeof cachedIndex === 'number') {
+                            cachedItems[cachedIndex] = item;
+                        }
+                        reachedCachedItem = true;
+                        continue;
+                    }
+
+                    fetchedItems.push(item);
                 }
 
                 offset += pageItems.length || CONFIG.pageSize;
-                isEnd = Boolean(data.paging?.is_end) || pageItems.length === 0 || (total > 0 && offset >= total);
-                setStatus(`正在查询收藏夹：${Math.min(offset, total || offset)} / ${total || '?'} 条`);
+                isEnd = Boolean(data.paging?.is_end)
+                    || pageItems.length === 0
+                    || (total > 0 && offset >= total)
+                    || (incremental && reachedCachedItem);
+
+                if (incremental) {
+                    setStatus(`正在增量更新：已检查 ${Math.min(offset, total || offset)} / ${total || '?'} 条，发现 ${fetchedItems.length} 条新增`);
+                } else {
+                    setStatus(`正在查询收藏夹：${Math.min(offset, total || offset)} / ${total || '?'} 条`);
+                }
             }
 
-            state.items = allItems;
-            state.total = total || allItems.length;
+            state.items = incremental ? mergeItems(fetchedItems, cachedItems) : mergeItems(fetchedItems, []);
+            state.total = total || state.items.length;
             state.loaded = true;
             saveCache();
-            setStatus(`已查询 ${allItems.length} 条收藏。输入关键词后搜索。`);
+            setStatus(incremental
+                ? `增量更新完成，新增 ${fetchedItems.length} 条，共 ${state.items.length} 条。输入关键词后搜索。`
+                : `已查询 ${state.items.length} 条收藏。输入关键词后搜索。`);
             renderResults(searchItems(state.ui.input.value.trim()), state.ui.input.value.trim());
         } catch (error) {
             console.error('[知乎收藏夹搜索] 查询失败:', error);
@@ -231,6 +256,24 @@
             state.loading = false;
             setLoading(false);
         }
+    }
+
+    function getItemKey(item) {
+        return item ? String(item.id || item.url || item.title || '') : '';
+    }
+
+    function mergeItems(primaryItems, fallbackItems) {
+        const merged = [];
+        const seen = new Set();
+
+        for (const item of [...primaryItems, ...fallbackItems]) {
+            const key = getItemKey(item);
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            merged.push(item);
+        }
+
+        return merged;
     }
 
     function normalizeItem(raw) {
